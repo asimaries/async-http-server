@@ -7,6 +7,7 @@ use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
 };
 
 async fn handle_client(mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
@@ -34,23 +35,58 @@ async fn handle_client(mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+// #[tokio::main]
+fn main() -> Result<(), Box<dyn Error>> {
+    let listener_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("acceptor-pool")
+        .enable_all()
+        .build()?;
 
-    let listener = TcpListener::bind("127.0.0.1:8000").await?;
-    println!("Server listening on http://localhost:8000");
+    let handler_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .thread_name("handler-pool")
+        .enable_all()
+        .build()?;
+
+    let (tx, mut rx) = mpsc::channel::<TcpStream>(4000);
+
+    handler_runtime.spawn(async move {
+        while let Some(sock) = rx.recv().await {
+            tokio::spawn(async move {
+                if let Err(e) = handle_client(sock).await {
+                    eprintln!("Error handling client: {}", e);
+                }
+            });
+        }
+    });
+    listener_runtime.block_on(async move {
+        let listener = match TcpListener::bind("127.0.0.1:8000").await {
+            Ok(listener) => listener,
+            Err(err) => panic!("error binding tcp listener: {}", err),
+        };
+        println!("Server listening on http://localhost:8000");
+        loop {
+            let sock = match accept_conn(&listener).await {
+                Ok(stream) => stream,
+
+                Err(err) => {
+                    println!("{:?}", err);
+                    panic!("{:?}", err);
+                }
+            };
+            let _ = tx.send(sock).await;
+        }
+    });
+
+    Ok(())
+}
+
+async fn accept_conn(listener: &TcpListener) -> Result<TcpStream, Box<dyn Error>> {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream).await {
-                        eprintln!("Error handling client: {}", e);
-                    }
-                });
-            }
-            Err(err) => {
-                println!("{:?}", err);
-            }
+            Ok((stream, _)) => return Ok(stream),
+            Err(e) => panic!("error accepting connection: {}", e),
         }
     }
 }
